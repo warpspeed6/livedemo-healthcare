@@ -1,8 +1,11 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "api/index.py", "use": "@vercel/python", "config": { "includeFiles": ["main.py"] } }
-  ],
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.11",
+      "includeFiles": ["main.py", "api/requirements.txt"]
+    }
+  },
   "routes": [
     { "src": "/(.*)", "dest": "api/index.py" }
   ]
