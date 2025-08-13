@@ -1,9 +1,7 @@
 import os
-from datetime import date, datetime, timedelta
-from typing import List, Optional
-
-import numpy as np
-import pandas as pd
+import random
+from datetime import date, timedelta
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,7 +24,7 @@ from sqlalchemy.pool import NullPool
 # -----------------------------
 
 RANDOM_SEED = 42
-rng = np.random.RandomState(RANDOM_SEED)
+rng = random.Random(RANDOM_SEED)
 
 
 def _generate_names(num: int) -> List[str]:
@@ -76,17 +74,15 @@ def _generate_names(num: int) -> List[str]:
     ]
     names: List[str] = []
     for _ in range(num):
-        names.append(
-            f"{rng.choice(first_names)} {rng.choice(last_names)}"
-        )
+        names.append(f"{rng.choice(first_names)} {rng.choice(last_names)}")
     return names
 
 
 def _random_last_visit(max_months_back: int = 24) -> date:
-    months_back = int(rng.randint(0, max_months_back + 1))
-    # Approximate months as 30 days to avoid external dependencies
-    days_back = int(months_back * 30 + rng.randint(0, 30))
-    return (date.today() - timedelta(days=days_back))
+    months_back = int(rng.randint(0, max_months_back))
+    # Approximate months as 30 days
+    days_back = int(months_back * 30 + rng.randint(0, 29))
+    return date.today() - timedelta(days=days_back)
 
 
 def _months_since(d: date, ref: Optional[date] = None) -> int:
@@ -96,46 +92,37 @@ def _months_since(d: date, ref: Optional[date] = None) -> int:
     return (ref.year - d.year) * 12 + (ref.month - d.month)
 
 
-def _derive_risks(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["bmi"] = (df["weight_kg"] / ((df["height_cm"] / 100) ** 2)).round(1)
-    df["months_since_last_visit"] = df["last_visit_date"].apply(_months_since)
-
-    df["is_hypertensive"] = (df["systolic_bp"] >= 140) | (df["diastolic_bp"] >= 90)
-    df["is_diabetes"] = df["hba1c_pct"] >= 6.5
-    df["is_hyperlipidemia"] = df["total_cholesterol_mgdl"] >= 200
-
-    risk_counts = (
-        df[["is_hypertensive", "is_diabetes", "is_hyperlipidemia"]]
-        .sum(axis=1)
-        .astype(int)
+def _compute_and_flags(row: Dict[str, Any]) -> Dict[str, Any]:
+    height_m = row["height_cm"] / 100.0
+    bmi = round(row["weight_kg"] / (height_m * height_m), 1)
+    months_since = _months_since(row["last_visit_date"])
+    is_hypertensive = row["systolic_bp"] >= 140 or row["diastolic_bp"] >= 90
+    is_diabetes = row["hba1c_pct"] >= 6.5
+    is_hyperlipidemia = row["total_cholesterol_mgdl"] >= 200
+    risk_count = int(is_hypertensive) + int(is_diabetes) + int(is_hyperlipidemia)
+    high_risk = risk_count >= 2 or months_since > 12
+    if high_risk:
+        risk_level = "High"
+    elif risk_count == 1:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
+    row.update(
+        {
+            "bmi": float(bmi),
+            "months_since_last_visit": int(months_since),
+            "is_hypertensive": bool(is_hypertensive),
+            "is_diabetes": bool(is_diabetes),
+            "is_hyperlipidemia": bool(is_hyperlipidemia),
+            "high_risk": bool(high_risk),
+            "risk_level": risk_level,
+        }
     )
-    df["high_risk"] = (risk_counts >= 2) | (df["months_since_last_visit"] > 12)
-
-    def _risk_level(row: pd.Series) -> str:
-        count = int(
-            row["is_hypertensive"] + row["is_diabetes"] + row["is_hyperlipidemia"]
-        )
-        if row["months_since_last_visit"] > 12 or count >= 2:
-            return "High"
-        if count == 1:
-            return "Medium"
-        return "Low"
-
-    df["risk_level"] = df.apply(_risk_level, axis=1)
-    return df
+    return row
 
 
-def generate_patients(num_patients: int = 50) -> pd.DataFrame:
-    patient_ids = np.arange(1, num_patients + 1)
+def generate_patients(num_patients: int = 50) -> List[Dict[str, Any]]:
     names = _generate_names(num_patients)
-    genders = rng.choice(["Male", "Female"], size=num_patients, p=[0.48, 0.52])
-    ages = rng.randint(20, 86, size=num_patients)
-
-    # Height and weight with reasonable ranges
-    heights_cm = rng.normal(loc=170, scale=10, size=num_patients).clip(150, 195).round()
-    weights_kg = rng.normal(loc=75, scale=15, size=num_patients).clip(45, 140).round(1)
-
     cities = [
         "New York",
         "San Francisco",
@@ -146,43 +133,32 @@ def generate_patients(num_patients: int = 50) -> pd.DataFrame:
         "Miami",
         "Denver",
     ]
-    city_values = rng.choice(cities, size=num_patients)
-
-    systolic = rng.normal(loc=128, scale=18, size=num_patients).clip(95, 190).round().astype(int)
-    diastolic = rng.normal(loc=82, scale=12, size=num_patients).clip(55, 120).round().astype(int)
-    heart_rate = rng.normal(loc=74, scale=10, size=num_patients).clip(48, 120).round().astype(int)
-    temperature_c = rng.normal(loc=36.8, scale=0.5, size=num_patients).clip(35.5, 39.5).round(1)
-    hba1c_pct = rng.normal(loc=5.9, scale=0.9, size=num_patients).clip(4.8, 10.5).round(1)
-    total_cholesterol = rng.normal(loc=195, scale=35, size=num_patients).clip(120, 320).round().astype(int)
-
-    last_visits = [
-        _random_last_visit(max_months_back=24) for _ in range(num_patients)
-    ]
-
-    df = pd.DataFrame(
-        {
-            "patient_id": patient_ids,
-            "name": names,
-            "age": ages,
-            "gender": genders,
-            "height_cm": heights_cm.astype(int),
-            "weight_kg": weights_kg,
-            "city": city_values,
-            "systolic_bp": systolic,
-            "diastolic_bp": diastolic,
-            "heart_rate": heart_rate,
-            "temperature_c": temperature_c,
-            "hba1c_pct": hba1c_pct,
-            "total_cholesterol_mgdl": total_cholesterol,
-            "last_visit_date": last_visits,
+    patients: List[Dict[str, Any]] = []
+    for i in range(num_patients):
+        height_cm = int(max(150, min(195, rng.gauss(170, 10))))
+        weight_kg = round(max(45.0, min(140.0, rng.gauss(75, 15))), 1)
+        row: Dict[str, Any] = {
+            "patient_id": i + 1,
+            "name": names[i],
+            "age": rng.randint(20, 85),
+            "gender": rng.choice(["Male", "Female"]),
+            "height_cm": height_cm,
+            "weight_kg": float(weight_kg),
+            "city": rng.choice(cities),
+            "systolic_bp": int(max(95, min(190, round(rng.gauss(128, 18))))),
+            "diastolic_bp": int(max(55, min(120, round(rng.gauss(82, 12))))),
+            "heart_rate": int(max(48, min(120, round(rng.gauss(74, 10))))),
+            "temperature_c": round(max(35.5, min(39.5, rng.gauss(36.8, 0.5))), 1),
+            "hba1c_pct": round(max(4.8, min(10.5, rng.gauss(5.9, 0.9))), 1),
+            "total_cholesterol_mgdl": int(max(120, min(320, round(rng.gauss(195, 35))))),
+            "last_visit_date": _random_last_visit(24),
         }
-    )
-    df = _derive_risks(df)
-    return df
+        patients.append(_compute_and_flags(row))
+    return patients
 
 
 # Create dataset at import time so both API and Streamlit can reuse it
-patients_df: pd.DataFrame = generate_patients(50)
+patients_data: List[Dict[str, Any]] = generate_patients(50)
 
 
 # -----------------------------
@@ -239,9 +215,9 @@ def init_db_if_configured() -> None:
     with Session(engine) as session:
         count = session.execute(select(Patient).limit(1)).first()
         if count is None:
-            # Seed from generated dataframe
+            # Seed from generated list
             records = []
-            for _, row in patients_df.iterrows():
+            for row in patients_data:
                 records.append(
                     Patient(
                         patient_id=int(row["patient_id"]),
@@ -321,7 +297,7 @@ app.add_middleware(
 )
 
 
-def generate_clinical_briefing(row: pd.Series) -> str:
+def generate_clinical_briefing(row: Dict[str, Any]) -> str:
     statements: List[str] = []
     risk_bits: List[str] = []
     if bool(row["is_hypertensive"]):
@@ -350,10 +326,10 @@ def generate_clinical_briefing(row: pd.Series) -> str:
             "Maintain regular follow-up and reinforce diet, exercise, and medication adherence as appropriate."
         )
 
-    return " " .join(statements)
+    return " ".join(statements)
 
 
-def _row_to_patient_response(row: pd.Series) -> PatientResponse:
+def _row_to_patient_response(row: Dict[str, Any]) -> PatientResponse:
     return PatientResponse(
         patient_id=int(row["patient_id"]),
         name=str(row["name"]),
@@ -386,8 +362,7 @@ def get_patient(patient_id: int) -> PatientWithBriefing:
             patient = session.get(Patient, patient_id)
             if patient is None:
                 raise HTTPException(status_code=404, detail="Patient not found")
-            # Convert ORM object to pandas Series-like for reuse
-            row = pd.Series({
+            row = {
                 "patient_id": patient.patient_id,
                 "name": patient.name,
                 "age": patient.age,
@@ -409,12 +384,11 @@ def get_patient(patient_id: int) -> PatientWithBriefing:
                 "is_hyperlipidemia": patient.is_hyperlipidemia,
                 "high_risk": patient.high_risk,
                 "risk_level": patient.risk_level,
-            })
+            }
     else:
-        match = patients_df.loc[patients_df["patient_id"] == patient_id]
-        if match.empty:
+        row = next((p for p in patients_data if p["patient_id"] == patient_id), None)
+        if row is None:
             raise HTTPException(status_code=404, detail="Patient not found")
-        row = match.iloc[0]
     patient_model = _row_to_patient_response(row)
     briefing = generate_clinical_briefing(row)
     return PatientWithBriefing(patient=patient_model, briefing=briefing)
@@ -425,17 +399,17 @@ def get_patient(patient_id: int) -> PatientWithBriefing:
 def root() -> dict:
     return {
         "message": "Healthcare Demo API. Use /patient/{id} to retrieve patient KPIs and briefing.",
-        "total_patients": int(patients_df.shape[0]) if engine is None else 50,
+        "total_patients": len(patients_data) if engine is None else 50,
     }
 
 
 @app.get("/patients")
 def list_patients() -> List[PatientResponse]:
-    rows: List[pd.Series] = []
+    rows: List[Dict[str, Any]] = []
     if engine is not None:
         with Session(engine) as session:
             for p in session.execute(select(Patient)).scalars().all():
-                rows.append(pd.Series({
+                rows.append({
                     "patient_id": p.patient_id,
                     "name": p.name,
                     "age": p.age,
@@ -457,10 +431,9 @@ def list_patients() -> List[PatientResponse]:
                     "is_hyperlipidemia": p.is_hyperlipidemia,
                     "high_risk": p.high_risk,
                     "risk_level": p.risk_level,
-                }))
+                })
     else:
-        for _, r in patients_df.iterrows():
-            rows.append(r)
+        rows = list(patients_data)
     return [_row_to_patient_response(r) for r in rows]
 
 
