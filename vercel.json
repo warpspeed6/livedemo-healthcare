@@ -3,7 +3,7 @@
   "functions": {
     "api/index.py": {
       "runtime": "python3.11",
-      "includeFiles": ["main.py", "api/requirements.txt"]
+      "includeFiles": "main.py"
     }
   },
   "routes": [
